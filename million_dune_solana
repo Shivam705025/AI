@@ -1,0 +1,359 @@
+-- ===========================================================================
+-- pump.fun "MILLION-DOLLAR RUNNER" feature set
+-- Target: reached >= $1M market cap within 5 min of creation AND did NOT dump.
+-- ===========================================================================
+-- Cheap-ish design:
+--   * early features + graduation from pump-only EVENT tables (small)
+--   * $1M detection + dump filter from dex_solana.trades WHERE project='pumpswap'
+--     ONLY (graduated tokens are a small subset -> far cheaper than all trades)
+--   * all creator features leakage-safe (prior tokens only)
+--
+-- Market cap = (amount_usd / token_amount) * 1e9  (pump.fun supply = 1,000,000,000)
+--
+-- >>> VERIFY: pump_evt_* table/col names ("user", sol_amount, is_buy, mint,
+--     evt_block_time); dex_solana.trades cols (project, block_date, amount_usd,
+--     token_bought/sold_mint_address, token_bought/sold_amount).
+-- COST: start with INTERVAL '7' DAY; widen as your Dune quota allows. If results
+--     are too big to fetch, add `WHERE random() < 0.5` before ORDER BY (creator
+--     features are computed on the full set, so they stay correct), or CSV-export.
+-- ===========================================================================
+
+WITH
+creates AS (
+    SELECT c.mint AS token_mint, c."user" AS creator, c.evt_block_time AS create_time
+    FROM pumpdotfun_solana.pump_evt_createevent c
+    WHERE c.evt_block_time >= now() - INTERVAL '90' DAY
+),
+
+-- ---- early window: first 5 minutes of bonding-curve trades (pump events) ----
+early_trades AS (
+    SELECT t.mint, t."user" AS trader, t.is_buy,
+           t.sol_amount / 1e9 AS sol, t.evt_block_time AS bt,
+           cr.creator, cr.create_time
+    FROM pumpdotfun_solana.pump_evt_tradeevent t
+    JOIN creates cr ON t.mint = cr.token_mint
+    WHERE t.evt_block_time >= now() - INTERVAL '90' DAY
+      AND t.evt_block_time <= cr.create_time + INTERVAL '5' MINUTE
+),
+early_agg AS (
+    SELECT
+        mint AS token_mint, creator, create_time,
+        count(*)                                          AS early_trades,
+        count(DISTINCT trader)                            AS early_unique_traders,
+        count(DISTINCT trader) FILTER (WHERE is_buy)      AS early_unique_buyers,
+        count(*) FILTER (WHERE is_buy)                    AS early_buys,
+        count(*) FILTER (WHERE NOT is_buy)                AS early_sells,
+        coalesce(sum(sol) FILTER (WHERE is_buy),0)        AS early_buy_sol,
+        coalesce(sum(sol) FILTER (WHERE NOT is_buy),0)    AS early_sell_sol,
+        max(sol)                                          AS early_max_trade_sol,
+        count(*) FILTER (WHERE is_buy AND trader=creator) AS creator_early_buys,
+        count(*) FILTER (WHERE NOT is_buy AND trader=creator) AS creator_early_sells,
+        date_diff('second', create_time, min(bt))        AS secs_to_first_trade,
+        -- velocity: trades in the first 30s (fast accumulation = runner signal)
+        count(*) FILTER (WHERE bt <= create_time + INTERVAL '30' SECOND) AS trades_first_30s
+    FROM early_trades
+    GROUP BY mint, creator, create_time
+),
+buyer_conc AS (
+    SELECT mint AS token_mint,
+           max(tsol)/nullif(sum(tsol),0) AS top_buyer_share
+    FROM (SELECT mint, trader, sum(sol) AS tsol FROM early_trades WHERE is_buy GROUP BY mint, trader) x
+    GROUP BY mint
+),
+
+-- ---- graduation (from pump complete event) ----
+graduation AS (
+    SELECT g.mint AS token_mint, min(g.evt_block_time) AS grad_time
+    FROM pumpdotfun_solana.pump_evt_completeevent g
+    WHERE g.evt_block_time >= now() - INTERVAL '91' DAY
+    GROUP BY g.mint
+),
+
+-- ---- post-grad market cap from PumpSwap trades (small subset of dex trades) --
+ps_trades AS (
+    SELECT
+        cr.token_mint, t.block_time, cr.create_time,
+        t.amount_usd /
+          nullif(CASE WHEN t.token_bought_mint_address = cr.token_mint
+                      THEN t.token_bought_amount ELSE t.token_sold_amount END, 0)
+          * 1e9 AS mcap_usd
+    FROM dex_solana.trades t
+    JOIN creates cr
+      ON (t.token_bought_mint_address = cr.token_mint OR t.token_sold_mint_address = cr.token_mint)
+    WHERE t.project = 'pumpswap'
+      AND t.block_date >= date_add('day', -91, current_date)
+      AND t.amount_usd > 0
+),
+mcap_windows AS (
+    SELECT
+        token_mint,
+        max(mcap_usd) FILTER (WHERE block_time <= create_time + INTERVAL '5' MINUTE) AS peak_5min,
+        max(mcap_usd) FILTER (WHERE block_time BETWEEN create_time + INTERVAL '30' MINUTE
+                                                   AND create_time + INTERVAL '60' MINUTE) AS mcap_30_60
+    FROM ps_trades
+    GROUP BY token_mint
+),
+
+-- ---- labels ----
+labeled AS (
+    SELECT
+        e.token_mint, e.creator, e.create_time,
+        coalesce(mw.peak_5min, 0)  AS peak_5min,
+        coalesce(mw.mcap_30_60, 0) AS mcap_30_60,
+        -- reached $1M within 5 min
+        CASE WHEN coalesce(mw.peak_5min,0) >= 1000000 THEN 1 ELSE 0 END AS reached_1m,
+        -- pump-and-dump: spiked (>= $500k) then gave back >70% by 30-60 min
+        CASE WHEN coalesce(mw.peak_5min,0) >= 500000
+              AND coalesce(mw.mcap_30_60,0) < 0.30 * coalesce(mw.peak_5min,0)
+             THEN 1 ELSE 0 END AS is_pump_dump,
+        -- TARGET: hit $1M in 5 min AND held >= 50% of peak (NOT a dump)
+        CASE WHEN coalesce(mw.peak_5min,0) >= 1000000
+              AND coalesce(mw.mcap_30_60,0) >= 0.50 * coalesce(mw.peak_5min,0)
+             THEN 1 ELSE 0 END AS target_runner
+    FROM early_agg e
+    LEFT JOIN mcap_windows mw ON e.token_mint = mw.token_mint
+)
+-- NOTE: creator-history features are NOT computed here (the self-join is the
+-- expensive part). millionrunner_predictor.py rebuilds them in pandas across the
+-- full 3-month set, leakage-safe — so this query stays cheap and chunk-friendly.
+
+SELECT
+    l.token_mint, l.creator, l.create_time,
+    -- early-window features
+    e.early_trades, e.early_unique_traders, e.early_unique_buyers,
+    e.early_buys, e.early_sells,
+    e.early_buys*1.0/nullif(e.early_sells,0)              AS early_buy_sell_ratio,
+    e.early_buy_sol, e.early_sell_sol,
+    e.early_buy_sol - e.early_sell_sol                    AS early_net_sol,
+    e.early_max_trade_sol, e.secs_to_first_trade, e.trades_first_30s,
+    coalesce(bc.top_buyer_share,0)                        AS top_buyer_share,
+    e.creator_early_buys, e.creator_early_sells,
+    CASE WHEN g.grad_time IS NOT NULL THEN 1 ELSE 0 END   AS graduated,
+    coalesce(date_diff('second', l.create_time, g.grad_time), 999999) AS secs_to_graduate,
+    -- (creator patterns are computed in Python from `creator` + `create_time`)
+    -- outcomes (for analysis)
+    l.peak_5min, l.mcap_30_60, l.reached_1m, l.is_pump_dump,
+    l.target_runner   -- <<< MODEL LABEL
+FROM labeled l
+JOIN early_agg e       ON l.token_mint = e.token_mint
+LEFT JOIN buyer_conc bc ON l.token_mint = bc.token_mint
+LEFT JOIN graduation g  ON l.token_mint = g.token_mint
+ORDER BY l.create_time
+
+
+
+
+"""
+millionrunner_predictor.py  —  run in Google Colab
+==================================================
+
+Learns what distinguishes pump.fun tokens that hit >= $1M within 5 min AND held
+it (target_runner) from everything else — and from pump-and-dumps specifically.
+
+Reads the output of millionrunner_features.sql (CSV export or Dune API).
+
+WHAT TO EXPECT (read this):
+  * target_runner is EXTREMELY rare (~0.05% — a few per day). The model gives a
+    ranked, dump-filtered watchlist with a modest edge, not a crystal ball.
+  * Judge it by precision@k and lift, NEVER accuracy (predicting "no" for all
+    is ~99.9% accurate and useless).
+  * LEAKAGE WARNING: if the query's early features span the SAME 5 min as the
+    label, the model "describes" rather than "predicts." For a truly predictive
+    model, narrow the feature window in the query (change the early_trades CTE
+    from INTERVAL '5' MINUTE to INTERVAL '60' SECOND) so features come BEFORE the
+    outcome. This script also drops the most outcome-coincident columns.
+
+Outputs: feature importances ("the patterns"), a runner-vs-dump-vs-dud profile,
+precision@k metrics, and an optional pure-JS model export.
+"""
+
+import subprocess, sys
+subprocess.run([sys.executable, "-m", "pip", "install", "-q",
+                "scikit-learn", "pandas", "numpy", "requests", "m2cgen", "joblib"])
+
+import json, numpy as np, pandas as pd, requests, joblib, m2cgen as m2c
+from sklearn.ensemble import RandomForestClassifier
+from sklearn.metrics import average_precision_score, roc_auc_score
+
+# --------------------------------------------------------------------------- #
+# CONFIG
+# --------------------------------------------------------------------------- #
+# Point at one CSV, or several monthly chunks to concatenate (3-month run split
+# into m1/m2/m3 to stay under Dune per-query limits).
+CSV_PATHS    = ["millionrunner.csv"]   # e.g. ["m1.csv", "m2.csv", "m3.csv"]
+DUNE_API_KEY = ""
+QUERY_ID     = ""
+LABEL    = "target_runner"
+TIME_COL = "create_time"
+
+# columns that are outcomes or identifiers — never features
+NON_FEATURES = {
+    "token_mint", "creator", "create_time",
+    "peak_5min", "mcap_30_60", "reached_1m", "is_pump_dump", "target_runner",
+}
+# outcome-coincident within the 5-min window — drop to avoid leakage.
+LEAKY = {"graduated", "secs_to_graduate"}
+
+# --------------------------------------------------------------------------- #
+# 1. LOAD  (concat monthly chunks; dedup tokens at boundaries)
+# --------------------------------------------------------------------------- #
+def fetch_dune(qid, key, page=25000, max_pages=2000):
+    h = {"X-Dune-API-Key": key}
+    url = f"https://api.dune.com/api/v1/query/{qid}/results?limit={page}"
+    rows = []
+    while url and len(rows) < max_pages * page:
+        r = requests.get(url, headers=h, timeout=120)
+        if r.status_code == 402:
+            print(f"  quota hit at {len(rows):,} rows — using what we have"); break
+        r.raise_for_status(); d = r.json()
+        rows += d.get("result", {}).get("rows", []); url = d.get("next_uri")
+        print(f"  {len(rows):,} rows...", end="\r")
+    return pd.DataFrame(rows)
+
+if CSV_PATHS and any(CSV_PATHS):
+    parts = [pd.read_csv(p) for p in CSV_PATHS if p]
+    df = pd.concat(parts, ignore_index=True)
+    print(f"loaded {len(df):,} rows from {len(parts)} file(s)")
+elif QUERY_ID and DUNE_API_KEY:
+    df = fetch_dune(QUERY_ID, DUNE_API_KEY)
+else:
+    raise SystemExit("Set CSV_PATHS (Dune CSV exports) or QUERY_ID + DUNE_API_KEY.")
+if len(df) == 0:
+    raise SystemExit("No rows — export the CSV(s) from Dune and set CSV_PATHS.")
+
+df = df.drop_duplicates(subset=["token_mint"], keep="first")   # chunk overlap safety
+
+# --------------------------------------------------------------------------- #
+# 2. PREPARE + BUILD CREATOR PATTERNS IN PANDAS (leakage-safe, across full set)
+# --------------------------------------------------------------------------- #
+df[TIME_COL] = pd.to_datetime(df[TIME_COL], errors="coerce")
+df = df.dropna(subset=[TIME_COL]).sort_values(TIME_COL).reset_index(drop=True)
+for c in ["target_runner", "is_pump_dump", "reached_1m", "peak_5min"]:
+    if c in df.columns:
+        df[c] = pd.to_numeric(df[c], errors="coerce").fillna(0.0)
+
+def build_creator_features(df):
+    """For each token, summarize the creator's PRIOR launches only (everything
+    strictly earlier in time). Sorted-by-time cumulative ops -> no leakage."""
+    g = df.groupby("creator", sort=False)
+    # prior counts (cumsum includes current -> subtract current to exclude it)
+    df["creator_prior_launches"] = g.cumcount()
+    df["creator_prior_runners"]  = g["target_runner"].cumsum() - df["target_runner"]
+    df["creator_prior_dumps"]    = g["is_pump_dump"].cumsum() - df["is_pump_dump"]
+    # best prior peak market cap (cummax shifted within creator)
+    df["creator_prior_best_mcap"] = (
+        g["peak_5min"].cummax().groupby(df["creator"], sort=False).shift(1).fillna(0))
+    # rates
+    pl = df["creator_prior_launches"].replace(0, np.nan)
+    df["creator_prior_runner_rate"] = (df["creator_prior_runners"] / pl).fillna(0)
+    df["creator_prior_dump_rate"]   = (df["creator_prior_dumps"]   / pl).fillna(0)
+    # timing
+    first = g[TIME_COL].transform("min")
+    prev  = g[TIME_COL].shift(1)
+    df["creator_age_days"] = (df[TIME_COL] - first).dt.total_seconds() / 86400.0
+    df["secs_since_last_launch"] = (df[TIME_COL] - prev).dt.total_seconds().fillna(0)
+    return df
+
+df = build_creator_features(df)
+print("built creator patterns:",
+      [c for c in df.columns if c.startswith("creator_prior") or c in
+       ("creator_age_days", "secs_since_last_launch")])
+
+FEATURES = [c for c in df.columns if c not in NON_FEATURES and c not in LEAKY]
+for c in FEATURES + [LABEL]:
+    df[c] = pd.to_numeric(df.get(c, 0), errors="coerce").fillna(0.0)
+
+n_pos = int(df[LABEL].sum())
+print(f"\ntokens: {len(df):,} | runners (target=1): {n_pos:,} ({df[LABEL].mean():.4%})")
+print(f"reached $1M: {int(df.get('reached_1m', pd.Series([0])).sum()):,} | "
+      f"pump-dumps: {int(df.get('is_pump_dump', pd.Series([0])).sum()):,}")
+print(f"features ({len(FEATURES)}): {FEATURES}")
+if n_pos < 20:
+    print("\n⚠️  Very few runners even over 3 months. Numbers below are directional only.")
+
+# --------------------------------------------------------------------------- #
+# 3. THE PATTERNS — runner vs pump-dump vs dud (what actually differs)
+# --------------------------------------------------------------------------- #
+print("\n=== PROFILE: median feature by outcome ===")
+grp = pd.DataFrame(index=FEATURES)
+masks = {
+    "runner":    df[LABEL] == 1,
+    "pumpdump":  df.get("is_pump_dump", 0) == 1,
+    "dud":       (df[LABEL] == 0) & (df.get("is_pump_dump", 0) == 0),
+}
+for name, m in masks.items():
+    grp[name] = df.loc[m, FEATURES].median() if m.sum() else np.nan
+grp["runner_vs_dump"] = grp["runner"] - grp["pumpdump"]
+print(grp.sort_values("runner_vs_dump", key=abs, ascending=False).round(3).head(15).to_string())
+
+# --------------------------------------------------------------------------- #
+# 4. TIME-SPLIT + TRAIN
+# --------------------------------------------------------------------------- #
+cut = int(len(df) * 0.8)
+tr, te = df.iloc[:cut], df.iloc[cut:]
+Xtr, ytr = tr[FEATURES].values, tr[LABEL].values.astype(int)
+Xte, yte = te[FEATURES].values, te[LABEL].values.astype(int)
+print(f"\ntrain {len(tr):,} ({ytr.sum()} pos) | test {len(te):,} ({yte.sum()} pos)")
+
+model = RandomForestClassifier(
+    n_estimators=500, max_depth=14, min_samples_leaf=8,
+    max_features="sqrt", class_weight="balanced_subsample",
+    n_jobs=-1, random_state=7,
+).fit(Xtr, ytr)
+
+# --------------------------------------------------------------------------- #
+# 5. EVALUATE — precision@k / lift / PR-AUC (the only honest metrics here)
+# --------------------------------------------------------------------------- #
+p = model.predict_proba(Xte)[:, 1]
+base = yte.mean() if len(yte) else 0
+print("\n=== Out-of-sample (time-split) ===")
+print(f"  base rate : {base:.4%}")
+if yte.sum() > 0:
+    print(f"  PR-AUC    : {average_precision_score(yte, p):.4f}")
+    if 0 < yte.sum() < len(yte):
+        print(f"  ROC-AUC   : {roc_auc_score(yte, p):.4f}")
+    for k in (10, 20, 50, 100):
+        if k <= len(yte):
+            idx = np.argsort(-p)[:k]; pk = yte[idx].mean()
+            print(f"  precision@{k:<3}: {pk:.3f}" + (f"  (lift {pk/base:.1f}x)" if base else ""))
+else:
+    print("  no positive runners in the test slice — widen the data window.")
+
+print("\n=== TOP PATTERNS (feature importance) ===")
+for f, imp in sorted(zip(FEATURES, model.feature_importances_),
+                     key=lambda kv: kv[1], reverse=True)[:15]:
+    print(f"  {f:<30} {imp:.3f}")
+
+# --------------------------------------------------------------------------- #
+# 6. EXPORT to pure JS (same RandomForest -> m2cgen path as your other model)
+# --------------------------------------------------------------------------- #
+try:
+    _ns = {}; exec(m2c.export_to_python(model), _ns)
+    ok = max(abs(_ns["score"](r.tolist())[1] - pp)
+             for r, pp in zip(Xte[:100], model.predict_proba(Xte[:100])[:, 1])) < 1e-6 \
+         if len(Xte) else True
+    js = m2c.export_to_javascript(model)
+    wrap = f"""
+
+const FEATURES = {json.dumps(FEATURES)};
+function predictRunner(feat) {{
+  const x = FEATURES.map(f => Number(feat[f] != null ? feat[f] : 0));
+  const o = score(x); const p = Array.isArray(o) ? o[1] : o;
+  return {{ probability: p }};
+}}
+if (typeof module !== "undefined" && module.exports)
+  module.exports = {{ score, predictRunner, FEATURES }};
+"""
+    open("millionrunner_model.js", "w").write(js + wrap)
+    joblib.dump(model, "millionrunner_model.joblib")
+    json.dump({"features": FEATURES, "label": LABEL, "base_rate": float(base),
+               "n_pos": int(n_pos)}, open("millionrunner_config.json", "w"), indent=2)
+    print(f"\nexported millionrunner_model.js (JS==python: {ok}), .joblib, config.json")
+    try:
+        from google.colab import files
+        for f in ("millionrunner_model.js", "millionrunner_config.json", "millionrunner_model.joblib"):
+            files.download(f)
+    except Exception:
+        pass
+except Exception as e:
+    print("JS export skipped:", e)
