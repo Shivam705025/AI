@@ -1,0 +1,116 @@
+-- ============================================================
+-- pump.fun MILLION-DOLLAR RUNNER features — trades-only build
+-- (no decoded event tables on this tier; dex_solana.trades has
+--  both pumpdotfun bonding-curve AND pumpswap trades)
+-- launch = first pumpdotfun trade per mint; dev = its trader_id
+-- features: first 60s | label: peak mcap within 5 min, held by 30-60m
+-- ============================================================
+WITH pf AS (   -- all pump.fun-related trades in window, mint-normalized
+    SELECT
+        block_time,
+        project,
+        trader_id,
+        amount_usd,
+        -- the pump.fun token side of the trade (the non-SOL/USDC leg)
+        CASE WHEN token_bought_mint_address NOT IN
+                  ('So11111111111111111111111111111111111111112',
+                   'EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v')
+             THEN token_bought_mint_address ELSE token_sold_mint_address END AS mint,
+        CASE WHEN token_bought_mint_address NOT IN
+                  ('So11111111111111111111111111111111111111112',
+                   'EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v')
+             THEN token_bought_amount ELSE token_sold_amount END AS token_amount,
+        -- is this trade a BUY of the pump token?
+        CASE WHEN token_bought_mint_address NOT IN
+                  ('So11111111111111111111111111111111111111112',
+                   'EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v')
+             THEN 1 ELSE 0 END AS is_buy
+    FROM dex_solana.trades
+    WHERE project IN ('pumpdotfun','pumpswap')
+      AND block_time >= NOW() - INTERVAL '30' DAY
+      AND amount_usd > 0
+),
+launch AS (    -- first pumpdotfun trade = launch; that trader = probable dev
+    SELECT mint, MIN(block_time) AS create_time
+    FROM pf
+    WHERE project = 'pumpdotfun'
+    GROUP BY mint
+),
+dev AS (
+    SELECT p.mint, p.trader_id AS creator
+    FROM pf p
+    JOIN launch l ON p.mint = l.mint AND p.block_time = l.create_time
+                 AND p.project = 'pumpdotfun'
+),
+mcap AS (      -- implied market cap per trade
+    SELECT mint, block_time, trader_id, is_buy, amount_usd,
+           (amount_usd / NULLIF(token_amount,0)) * 1e9 AS mcap_usd
+    FROM pf
+),
+-- ---- FEATURES: first 60 seconds only (strictly before the 5-min label) ----
+early AS (
+    SELECT
+        l.mint, l.create_time, d.creator,
+        COUNT(*)                                                AS early_trades,
+        COUNT(DISTINCT m.trader_id)                             AS early_unique_traders,
+        COUNT(DISTINCT CASE WHEN m.is_buy=1 THEN m.trader_id END) AS early_unique_buyers,
+        SUM(m.is_buy)                                           AS early_buys,
+        SUM(1-m.is_buy)                                         AS early_sells,
+        SUM(CASE WHEN m.is_buy=1 THEN m.amount_usd ELSE 0 END)  AS early_buy_usd,
+        SUM(CASE WHEN m.is_buy=0 THEN m.amount_usd ELSE 0 END)  AS early_sell_usd,
+        MAX(m.amount_usd)                                       AS early_max_trade_usd,
+        COUNT(*) FILTER (WHERE m.block_time <= l.create_time + INTERVAL '30' SECOND) AS trades_first_30s,
+        COUNT(*) FILTER (WHERE m.trader_id = d.creator AND m.is_buy=0)  AS creator_early_sells
+    FROM launch l
+    JOIN dev d   ON l.mint = d.mint
+    JOIN mcap m  ON l.mint = m.mint
+                AND m.block_time <= l.create_time + INTERVAL '60' SECOND
+    GROUP BY l.mint, l.create_time, d.creator
+),
+conc AS (      -- top buyer concentration in the early window (bundle signal)
+    SELECT mint, MAX(tu)/NULLIF(SUM(tu),0) AS top_buyer_share
+    FROM (
+        SELECT m.mint, m.trader_id, SUM(m.amount_usd) AS tu
+        FROM mcap m JOIN launch l ON m.mint=l.mint
+        WHERE m.is_buy=1 AND m.block_time <= l.create_time + INTERVAL '60' SECOND
+        GROUP BY m.mint, m.trader_id
+    ) x GROUP BY mint
+),
+-- ---- LABEL: peak mcap within 5 min, and whether held by 30-60 min ----
+windows AS (
+    SELECT
+        m.mint,
+        MAX(m.mcap_usd) FILTER (WHERE m.block_time <= l.create_time + INTERVAL '5' MINUTE) AS peak_5min,
+        MAX(m.mcap_usd) FILTER (WHERE m.block_time BETWEEN l.create_time + INTERVAL '30' MINUTE
+                                                       AND l.create_time + INTERVAL '60' MINUTE) AS mcap_30_60
+    FROM mcap m JOIN launch l ON m.mint = l.mint
+    GROUP BY m.mint
+),
+graduated AS (
+    SELECT DISTINCT mint FROM pf WHERE project='pumpswap'
+)
+SELECT
+    e.mint AS token_mint, e.creator, e.create_time,
+    e.early_trades, e.early_unique_traders, e.early_unique_buyers,
+    e.early_buys, e.early_sells,
+    e.early_buys*1.0/NULLIF(e.early_sells,0)   AS early_buy_sell_ratio,
+    e.early_buy_usd, e.early_sell_usd,
+    e.early_buy_usd - e.early_sell_usd          AS early_net_usd,
+    e.early_max_trade_usd, e.trades_first_30s,
+    e.creator_early_sells,
+    COALESCE(c.top_buyer_share,0)               AS top_buyer_share,
+    CASE WHEN g.mint IS NOT NULL THEN 1 ELSE 0 END AS graduated,
+    COALESCE(w.peak_5min,0)                      AS peak_5min,
+    COALESCE(w.mcap_30_60,0)                     AS mcap_30_60,
+    CASE WHEN COALESCE(w.peak_5min,0) >= 1000000 THEN 1 ELSE 0 END AS reached_1m,
+    CASE WHEN COALESCE(w.peak_5min,0) >= 500000
+          AND COALESCE(w.mcap_30_60,0) < 0.30*COALESCE(w.peak_5min,0)
+         THEN 1 ELSE 0 END                       AS is_pump_dump,
+    CASE WHEN COALESCE(w.peak_5min,0) >= 1000000
+          AND COALESCE(w.mcap_30_60,0) >= 0.50*COALESCE(w.peak_5min,0)
+         THEN 1 ELSE 0 END                       AS target_runner
+FROM early e
+LEFT JOIN conc c      ON e.mint = c.mint
+LEFT JOIN windows w   ON e.mint = w.mint
+LEFT JOIN graduated g ON e.mint = g.mint
+ORDER BY e.create_time
